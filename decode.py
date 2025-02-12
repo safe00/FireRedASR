@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import torch
+import onnxruntime as ort
 from onnxruntime.quantization import QuantType, quantize_dynamic
 
 from fireredasr.data.asr_feat import CMVN, ASRFeatExtractor
@@ -26,6 +27,65 @@ from typing import Tuple
 import kaldi_native_fbank as knf
 import numpy as np
 import soundfile as sf
+
+import onnxruntime
+
+
+class OnnxModel:
+    def __init__(
+        self,
+        encoder: str,
+    ):
+        session_opts = ort.SessionOptions()
+        session_opts.inter_op_num_threads = 1
+        session_opts.intra_op_num_threads = 4
+
+        self.session_opts = session_opts
+
+        self.init_encoder(encoder)
+
+    def init_encoder(self, encoder: str):
+        self.encoder = ort.InferenceSession(
+            encoder,
+            sess_options=self.session_opts,
+            providers=["CPUExecutionProvider"],
+        )
+
+        print("---encoder input----")
+        for i in self.encoder.get_inputs():
+            print(i)
+
+        print("---encoder output----")
+
+        for i in self.encoder.get_outputs():
+            print(i)
+        print("------------")
+
+    def run_encoder(
+        self,
+        x: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+          x: (N, T, C)
+        """
+        x_len = torch.tensor([x.shape[1]], dtype=torch.int64)
+        encoder_out, encoder_out_len, encoder_mask = self.encoder.run(
+            [
+                self.encoder.get_outputs()[0].name,
+                self.encoder.get_outputs()[1].name,
+                self.encoder.get_outputs()[2].name,
+            ],
+            {
+                self.encoder.get_inputs()[0].name: x.numpy(),
+                self.encoder.get_inputs()[1].name: x_len.numpy(),
+            },
+        )
+        return (
+            torch.from_numpy(encoder_out),
+            torch.from_numpy(encoder_out_len),
+            torch.from_numpy(encoder_mask),
+        )
 
 
 def load_audio(filename: str) -> Tuple[np.ndarray, int]:
@@ -104,9 +164,17 @@ def main():
         f"total parameters: {total_num_param}, or {total_num_param/1000/1000} million, or {total_num_param/1000/1000/1000} billion"
     )
 
-    x = x.unsqueeze(0)
+    onnx = OnnxModel(encoder="./onnx/encoder.int8.onnx")
 
-    if True:
+    x = x.unsqueeze(0)
+    use_onnx = True
+
+    if use_onnx:
+        enc_outputs, _, enc_mask = onnx.run_encoder(x)
+        hyp = model.model.decoder.batch_beam_search(
+            enc_outputs, enc_mask, 1, 1, 0, 1.0, 0.0, 1.0
+        )[0][0]
+    elif True:
         enc_outputs, _, enc_mask = model.model.encoder(
             x, torch.tensor([x.shape[1]], dtype=torch.int64)
         )
