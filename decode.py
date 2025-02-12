@@ -8,6 +8,7 @@ from onnxruntime.quantization import QuantType, quantize_dynamic
 
 from fireredasr.data.asr_feat import CMVN, ASRFeatExtractor
 from fireredasr.models.fireredasr import FireRedAsr
+from fireredasr.models.module.transformer_decoder import TransformerDecoder
 
 """
 model args:
@@ -29,6 +30,37 @@ import numpy as np
 import soundfile as sf
 
 import onnxruntime
+
+
+class ModifiedEncoder(torch.nn.Module):
+    def __init__(self, encoder: torch.nn.Module, decoder: torch.nn.Module):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def forward(
+        self, x: torch.Tensor, x_lens: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+          x: (N, T, C)
+          x_len: (N,)
+        Returns:
+          a tuple containing:
+            - n_layer_cross_k_cache: (num_dec_layers, N, T, d_model)
+            - n_layer_cross_v_cache: (num_dec_layers, N, T, d_model)
+        """
+        encoder_out, _, _ = self.encoder(x, x_len)
+
+        n_layer_cross_k_list = []
+        n_layer_cross_v_list = []
+        for layer in self.decoder.layer_stack:
+            k = layer.cross_attn.w_ks(encoder_out)
+            v = layer.cross_attn.w_vs(encoder_out)
+            n_layer_cross_k_list.append(k)
+            n_layer_cross_v_list.append(v)
+
+        return torch.stack(n_layer_cross_k_list), torch.stack(n_layer_cross_v_list)
 
 
 class OnnxModel:
@@ -146,6 +178,8 @@ def main():
     cmvn = CMVN("/star-fj/fangjun/open-source/icefall-models/FireRedASR-AED-L/cmvn.ark")
     x = cmvn(features).float()
 
+    x = x.unsqueeze(0)
+
     d = "/star-fj/fangjun/open-source/icefall-models/FireRedASR-AED-L"
     model = FireRedAsr.from_pretrained("aed", d)
     model.model.eval()
@@ -164,6 +198,51 @@ def main():
         f"total parameters: {total_num_param}, or {total_num_param/1000/1000} million, or {total_num_param/1000/1000/1000} billion"
     )
 
+    encoder = ModifiedEncoder(model.model.encoder, model.model.decoder)
+    x_len = torch.tensor([x.shape[1]], dtype=torch.int64)
+
+    n_layer_cross_k_cache, n_layer_cross_v_cache = encoder(x, x_len)
+    print(n_layer_cross_k_cache.shape)
+    print(n_layer_cross_v_cache.shape)
+
+    encoder_filename = "onnx/encoder.onnx"
+    opset_version = 13
+
+    if not Path(encoder_filename).is_file():
+        x0 = torch.rand(1, 1000, 80)
+        x0_len = torch.tensor([x0.shape[1]], dtype=torch.int64)
+        torch.onnx.export(
+            encoder,
+            (x0, x0_len),
+            encoder_filename,
+            verbose=False,
+            opset_version=opset_version,
+            input_names=["x"],
+            output_names=["n_layer_cross_k", "n_layer_cross_v"],
+            dynamic_axes={
+                "x": {0: "N", 1: "T"},
+                "n_layer_cross_k": {1: "N", 2: "T"},
+                "n_layer_cross_v": {1: "N", 2: "T"},
+            }
+            if False
+            else {
+                "x": {1: "T"},
+                "n_layer_cross_k": {2: "T"},
+                "n_layer_cross_v": {2: "T"},
+            },
+        )
+
+    encoder_filename_int8 = "onnx/encoder.int8.onnx"
+    if not Path(encoder_filename_int8).is_file():
+        quantize_dynamic(
+            model_input=encoder_filename,
+            model_output=encoder_filename_int8,
+            op_types_to_quantize=["MatMul"],
+            weight_type=QuantType.QInt8,
+        )
+
+    return
+
     onnx = OnnxModel(encoder="./onnx/encoder.int8.onnx")
 
     x = x.unsqueeze(0)
@@ -171,6 +250,8 @@ def main():
 
     if use_onnx:
         enc_outputs, _, enc_mask = onnx.run_encoder(x)
+        model.model.decoder(enc_outputs)
+        return
         hyp = model.model.decoder.batch_beam_search(
             enc_outputs, enc_mask, 1, 1, 0, 1.0, 0.0, 1.0
         )[0][0]
