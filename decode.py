@@ -2,13 +2,18 @@
 
 from pathlib import Path
 
-import torch
 import onnxruntime as ort
+import torch
 from onnxruntime.quantization import QuantType, quantize_dynamic
+from torch import Tensor
 
 from fireredasr.data.asr_feat import CMVN, ASRFeatExtractor
 from fireredasr.models.fireredasr import FireRedAsr
-from fireredasr.models.module.transformer_decoder import TransformerDecoder
+from fireredasr.models.module.transformer_decoder import (
+    DecoderLayer,
+    DecoderMultiHeadAttention,
+    TransformerDecoder,
+)
 
 """
 model args:
@@ -27,9 +32,8 @@ from typing import Tuple
 
 import kaldi_native_fbank as knf
 import numpy as np
-import soundfile as sf
-
 import onnxruntime
+import soundfile as sf
 
 
 class ModifiedEncoder(torch.nn.Module):
@@ -39,7 +43,7 @@ class ModifiedEncoder(torch.nn.Module):
         self.decoder = decoder
 
     def forward(
-        self, x: torch.Tensor, x_lens: torch.Tensor
+        self, x: torch.Tensor, x_len: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -61,6 +65,162 @@ class ModifiedEncoder(torch.nn.Module):
             n_layer_cross_v_list.append(v)
 
         return torch.stack(n_layer_cross_k_list), torch.stack(n_layer_cross_v_list)
+
+
+class MultiHeadAttentionSelf(torch.nn.Module):
+    def __init__(self, attn: DecoderMultiHeadAttention):
+        super().__init__()
+        self.attn = attn
+
+    def forward(
+        self,
+        x: Tensor,  # (b, n_ctx      , n_state)
+        k_cache: Tensor,  # (b, n_ctx_cache, n_head, d_k)
+        v_cache: Tensor,  # (b, n_ctx_cache, n_head, d_k)
+    ):
+        bs = x.size(0)
+
+        q = self.attn.w_qs(x).view(bs, -1, self.attn.n_head, self.attn.d_k)
+        k = self.attn.w_ks(x).view(bs, -1, self.attn.n_head, self.attn.d_k)
+        v = self.attn.w_vs(x).view(bs, -1, self.attn.n_head, self.attn.d_k)
+
+        k_cache[:, -k.shape[1] :, :] = k  # (b, n_ctx_cache + n_ctx, n_head, d_k)
+        v_cache[:, -v.shape[1] :, :] = v  # (b, n_ctx_cache + n_ctx, n_head, d_k)
+
+        q = q.transpose(1, 2)
+
+        output = self.attn.attention(
+            q,
+            k_cache.transpose(1, 2),
+            v_cache.transpose(1, 2),
+        )
+
+        output = output.transpose(1, 2).contiguous().view(bs, -1, self.attn.d_model)
+
+        output = self.attn.fc(output)
+
+        return output, k_cache, v_cache
+
+
+class MultiHeadAttentionCross(torch.nn.Module):
+    def __init__(self, attn: DecoderMultiHeadAttention):
+        super().__init__()
+        self.attn = attn
+
+    def forward(
+        self,
+        x: Tensor,
+        k: Tensor,
+        v: Tensor,
+    ):
+        bs = x.size(0)
+
+        q = self.attn.w_qs(x).view(bs, -1, self.attn.n_head, self.attn.d_k)
+        k = k.view(bs, -1, self.attn.n_head, self.attn.d_k)
+        v = v.view(bs, -1, self.attn.n_head, self.attn.d_k)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        output = self.attn.attention(q, k, v)
+
+        output = output.transpose(1, 2).contiguous().view(bs, -1, self.attn.d_model)
+        output = self.attn.fc(output)
+
+        return output
+
+
+class ModifiedDecoderLayer(torch.nn.Module):
+    def __init__(self, layer: DecoderLayer):
+        super().__init__()
+        self.layer = layer
+        self.attn = MultiHeadAttentionSelf(layer.self_attn)
+        self.cross_attn = MultiHeadAttentionCross(layer.cross_attn)
+
+    def forward(
+        self,
+        x: Tensor,
+        self_k_cache: Tensor,
+        self_v_cache: Tensor,
+        cross_k: Tensor,
+        cross_v: Tensor,
+    ):
+        """
+        Args:
+          x: (N, 1, d)
+          self_k_cache: (N, num_processed_tokens, num_head, head_dim)
+          self_v_cache: (N, num_processed_tokens, num_head, head_dim)
+          cross_k: (N, T, d)
+          cross_v: (N, T, d)
+        """
+        self_attn_x, self_k_cache_updated, self_v_cache_updated = self.attn(
+            self.layer.self_attn_norm(x),
+            self_k_cache,
+            self_v_cache,
+        )
+
+        x = x + self_attn_x
+
+        x = x + self.cross_attn(self.layer.cross_attn_norm(x), cross_k, cross_v)
+
+        x = x + self.layer.mlp(self.layer.mlp_norm(x))
+
+        return x, self_k_cache_updated, self_v_cache_updated
+
+
+class ModifiedTransformerDecoder(torch.nn.Module):
+    def __init__(self, decoder: TransformerDecoder, max_len=1024):
+        super().__init__()
+        self.decoder = decoder
+
+        self.blocks = []
+        for orginal_block in self.decoder.layer_stack:
+            self.blocks.append(ModifiedDecoderLayer(orginal_block))
+
+    def forward(
+        self,
+        tokens: Tensor,
+        n_layer_self_k_cache: Tensor,
+        n_layer_self_v_cache: Tensor,
+        n_layer_cross_k: Tensor,
+        n_layer_cross_v: Tensor,
+        offset: Tensor,
+    ):
+        """
+        Args:
+          tokens: (N, num_tokens)
+        """
+        x = (
+            self.decoder.tgt_word_emb(tokens) * self.decoder.scale
+            + self.decoder.positional_encoding.pe[
+                :, offset[0] : offset[0] + tokens.shape[-1]
+            ]
+        )
+
+        x = x.to(n_layer_cross_k[0].dtype)
+
+        i = 0
+        for block in self.blocks:
+            self_k_cache = n_layer_self_k_cache[i, :, : offset[0] + tokens.shape[-1], :]
+            self_v_cache = n_layer_self_v_cache[i, :, : offset[0] + tokens.shape[-1], :]
+
+            x, self_k_cache, self_v_cache = block(
+                x,
+                self_k_cache=self_k_cache,
+                self_v_cache=self_v_cache,
+                cross_k=n_layer_cross_k[i],
+                cross_v=n_layer_cross_v[i],
+            )
+
+            n_layer_self_k_cache[i, :, : offset[0] + tokens.shape[-1], :] = self_k_cache
+            n_layer_self_v_cache[i, :, : offset[0] + tokens.shape[-1], :] = self_v_cache
+            i += 1
+
+        x = self.decoder.layer_norm_out(x)
+
+        logits = self.decoder.tgt_word_prj(x)
+        return logits, n_layer_self_k_cache, n_layer_self_v_cache
 
 
 class OnnxModel:
@@ -201,12 +361,112 @@ def main():
     encoder = ModifiedEncoder(model.model.encoder, model.model.decoder)
     x_len = torch.tensor([x.shape[1]], dtype=torch.int64)
 
-    n_layer_cross_k_cache, n_layer_cross_v_cache = encoder(x, x_len)
-    print(n_layer_cross_k_cache.shape)
-    print(n_layer_cross_v_cache.shape)
+    n_layer_cross_k, n_layer_cross_v = encoder(x, x_len)
+    print(n_layer_cross_k.shape)  # (16, 1, 166, 1280)
+    print(n_layer_cross_v.shape)
+    assert (
+        n_layer_cross_k.shape[0] == model.model.decoder.n_layers
+    ), n_layer_cross_k.shape
+    assert n_layer_cross_k.shape[1] == 1, "batch size is 1"
+    # n_layer_cross_k_cache.shape[2] is T
+
+    d_model = model.model.decoder.tgt_word_prj.weight.shape[1]
+
+    assert n_layer_cross_k.shape[3] == d_model, "batch size is 1"
+
+    max_len = 1024
+
+    decoder = ModifiedTransformerDecoder(model.model.decoder, max_len)
+    num_head = decoder.blocks[0].attn.attn.n_head
+    head_dim = decoder.blocks[0].attn.attn.d_k
+    n_layer_self_k_cache = torch.zeros(
+        (
+            len(model.model.decoder.layer_stack),
+            1,  # batch size
+            max_len,
+            num_head,
+            head_dim,
+        ),
+    )
+    n_layer_self_v_cache = torch.zeros(
+        (len(model.model.decoder.layer_stack), 1, max_len, num_head, head_dim),
+    )
+    offset = torch.zeros(1, dtype=torch.int64)
+
+    tokens = torch.tensor([[model.model.decoder.sos_id]])
+
+    print("eos id", model.model.decoder.eos_id)
+    results = []
+    for i in range(0, max_len):
+        logits, n_layer_self_k_cache, n_layer_self_v_cache = decoder(
+            tokens,
+            n_layer_self_k_cache,
+            n_layer_self_v_cache,
+            n_layer_cross_k,
+            n_layer_cross_v,
+            offset,
+        )
+        max_token_id = logits.argmax(dim=-1)
+        if max_token_id.item() == model.model.decoder.eos_id:
+            break
+        results.append(max_token_id.item())
+        tokens = max_token_id
+        offset += 1
+    print(results)
+    text = model.tokenizer.detokenize(results)
+    print(text)
+
+    opset_version = 13
+    decoder_filename = f"onnx/decoder.onnx"
+
+    offset = torch.zeros(1, dtype=torch.int64)
+
+    if not Path(decoder_filename).is_file():
+        torch.onnx.export(
+            decoder,
+            (
+                tokens,
+                n_layer_self_k_cache,
+                n_layer_self_v_cache,
+                n_layer_cross_k,
+                n_layer_cross_v,
+                offset,
+            ),
+            decoder_filename,
+            opset_version=opset_version,
+            input_names=[
+                "tokens",
+                "in_n_layer_self_k_cache",
+                "in_n_layer_self_v_cache",
+                "n_layer_cross_k",
+                "n_layer_cross_v",
+                "offset",
+            ],
+            output_names=[
+                "logits",
+                "out_n_layer_self_k_cache",
+                "out_n_layer_self_v_cache",
+            ],
+            dynamic_axes={
+                "in_n_layer_self_k_cache": {2: "T"},
+                "in_n_layer_self_v_cache": {2: "T"},
+                "n_layer_cross_k": {2: "T"},
+                "n_layer_cross_v": {2: "T"},
+            },
+        )
+
+    decoder_filename_int8 = "onnx/decoder.int8.onnx"
+    if not Path(decoder_filename_int8).is_file():
+        quantize_dynamic(
+            model_input=decoder_filename,
+            model_output=decoder_filename_int8,
+            op_types_to_quantize=["MatMul"],
+            weight_type=QuantType.QInt8,
+        )
+
+    return
 
     encoder_filename = "onnx/encoder.onnx"
-    opset_version = 13
 
     if not Path(encoder_filename).is_file():
         x0 = torch.rand(1, 1000, 80)
