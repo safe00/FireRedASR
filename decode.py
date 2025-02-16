@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
+# Copyright      2025  Xiaomi Corp.        (authors: Fangjun Kuang)
 
 from pathlib import Path
+from typing import Any, Dict
 
+import onnx
 import onnxruntime as ort
 import torch
 from onnxruntime.quantization import QuantType, quantize_dynamic
@@ -34,6 +37,28 @@ import kaldi_native_fbank as knf
 import numpy as np
 import onnxruntime
 import soundfile as sf
+
+
+def add_meta_data(filename: str, meta_data: Dict[str, Any]):
+    """Add meta data to an ONNX model. It is changed in-place.
+
+    Args:
+      filename:
+        Filename of the ONNX model to be changed.
+      meta_data:
+        Key-value pairs.
+    """
+    model = onnx.load(filename)
+
+    while len(model.metadata_props):
+        model.metadata_props.pop()
+
+    for key, value in meta_data.items():
+        meta = model.metadata_props.add()
+        meta.key = key
+        meta.value = str(value)
+
+    onnx.save(model, filename)
 
 
 class ModifiedEncoder(torch.nn.Module):
@@ -379,9 +404,10 @@ def main():
     decoder = ModifiedTransformerDecoder(model.model.decoder, max_len)
     num_head = decoder.blocks[0].attn.attn.n_head
     head_dim = decoder.blocks[0].attn.attn.d_k
+    num_decoder_layers = len(model.model.decoder.layer_stack)
     n_layer_self_k_cache = torch.zeros(
         (
-            len(model.model.decoder.layer_stack),
+            num_decoder_layers,
             1,  # batch size
             max_len,
             num_head,
@@ -389,7 +415,7 @@ def main():
         ),
     )
     n_layer_self_v_cache = torch.zeros(
-        (len(model.model.decoder.layer_stack), 1, max_len, num_head, head_dim),
+        (num_decoder_layers, 1, max_len, num_head, head_dim),
     )
     offset = torch.zeros(1, dtype=torch.int64)
 
@@ -417,7 +443,7 @@ def main():
     print(text)
 
     opset_version = 13
-    decoder_filename = f"onnx/decoder.onnx"
+    decoder_filename = "onnx/decoder.onnx"
 
     offset = torch.zeros(1, dtype=torch.int64)
 
@@ -448,8 +474,13 @@ def main():
                 "out_n_layer_self_v_cache",
             ],
             dynamic_axes={
-                "in_n_layer_self_k_cache": {2: "T"},
-                "in_n_layer_self_v_cache": {2: "T"},
+                "in_n_layer_self_k_cache": {1: "N", 2: "T"},
+                "in_n_layer_self_v_cache": {1: "N", 2: "T"},
+                "n_layer_cross_k": {1: "N", 2: "T"},
+                "n_layer_cross_v": {1: "N", 2: "T"},
+            }
+            if False
+            else {
                 "n_layer_cross_k": {2: "T"},
                 "n_layer_cross_v": {2: "T"},
             },
@@ -464,8 +495,6 @@ def main():
             weight_type=QuantType.QInt8,
         )
 
-    return
-
     encoder_filename = "onnx/encoder.onnx"
 
     if not Path(encoder_filename).is_file():
@@ -477,10 +506,11 @@ def main():
             encoder_filename,
             verbose=False,
             opset_version=opset_version,
-            input_names=["x"],
+            input_names=["x", "x_len"],
             output_names=["n_layer_cross_k", "n_layer_cross_v"],
             dynamic_axes={
                 "x": {0: "N", 1: "T"},
+                "x_len": {0: "N"},
                 "n_layer_cross_k": {1: "N", 2: "T"},
                 "n_layer_cross_v": {1: "N", 2: "T"},
             }
@@ -501,6 +531,32 @@ def main():
             weight_type=QuantType.QInt8,
         )
 
+        cmvn_mean = model.feat_extractor.cmvn.means.astype(np.float32)
+        cmvn_inv_stddev = model.feat_extractor.cmvn.inverse_std_variences.astype(
+            np.float32
+        )
+
+        encoder_meta_data = {
+            "model_type": "fire-red-asr-aed",
+            "version": "1",
+            "model_author": "FireRedTeam",
+            "maintainer": "k2-fsa",
+            "feat_dim": 80,
+            "cmvn_mean": ",".join(list(map(str, cmvn_mean.tolist()))),
+            "cmvn_inv_stddev": ",".join(list(map(str, cmvn_inv_stddev.tolist()))),
+            "num_decoder_layers": num_decoder_layers,
+            "num_head": num_head,
+            "head_dim": head_dim,
+            "max_len": max_len,
+            "sos": model.model.decoder.sos_id,
+            "eos": model.model.decoder.eos_id,
+            "url": "https://github.com/FireRedTeam/FireRedASR",
+            "url-2": "https://huggingface.co/FireRedTeam/FireRedASR-AED-L",
+            "comment": "This is FireRedASR-AED-L",
+        }
+
+        print(f"encoder_meta_data: {encoder_meta_data}")
+        add_meta_data(filename=encoder_filename_int8, meta_data=encoder_meta_data)
     return
 
     onnx = OnnxModel(encoder="./onnx/encoder.int8.onnx")

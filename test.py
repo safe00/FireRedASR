@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-
-from fireredasr.models.fireredasr import FireRedAsr
-from onnxruntime.quantization import QuantType, quantize_dynamic
-import torch
+# Copyright      2025  Xiaomi Corp.        (authors: Fangjun Kuang)
 
 from pathlib import Path
+
+import torch
+from onnxruntime.quantization import QuantType, quantize_dynamic
+
+from fireredasr.models.fireredasr import FireRedAsr
 
 """
 model args:
