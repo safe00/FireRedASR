@@ -18,6 +18,26 @@ from fireredasr.models.module.transformer_decoder import (
     TransformerDecoder,
 )
 
+import onnxmltools
+from onnxmltools.utils.float16_converter import (
+    convert_float_to_float16,
+    convert_float_to_float16_model_path,
+)
+
+
+def export_onnx_fp16(onnx_fp32_path, onnx_fp16_path):
+    onnx_fp32_model = onnxmltools.utils.load_model(onnx_fp32_path)
+    onnx_fp16_model = convert_float_to_float16(onnx_fp32_model, keep_io_types=True)
+    onnxmltools.utils.save_model(onnx_fp16_model, onnx_fp16_path)
+
+
+def export_onnx_fp16_large_2gb(onnx_fp32_path, onnx_fp16_path):
+    onnx_fp16_model = convert_float_to_float16_model_path(
+        onnx_fp32_path, keep_io_types=True
+    )
+    onnxmltools.utils.save_model(onnx_fp16_model, onnx_fp16_path)
+
+
 """
 model args:
 Namespace(blank='<blank>', blank_id=0, d_inner=5120, d_model=1280,
@@ -486,6 +506,11 @@ def main():
             },
         )
 
+    decoder_filename_fp16 = "onnx/decoder.fp16.onnx"
+    if not Path(decoder_filename_fp16).is_file():
+        print(f"exporting fp16 decoder")
+        export_onnx_fp16(decoder_filename, decoder_filename_fp16)
+
     decoder_filename_int8 = "onnx/decoder.int8.onnx"
     if not Path(decoder_filename_int8).is_file():
         quantize_dynamic(
@@ -521,6 +546,38 @@ def main():
                 "n_layer_cross_v": {2: "T"},
             },
         )
+
+    encoder_filename_fp16 = "onnx/encoder.fp16.onnx"
+    if not Path(encoder_filename_fp16).is_file():
+        print(f"exporting fp16 encoder")
+        export_onnx_fp16_large_2gb(encoder_filename, encoder_filename_fp16)
+
+        cmvn_mean = model.feat_extractor.cmvn.means.astype(np.float32)
+        cmvn_inv_stddev = model.feat_extractor.cmvn.inverse_std_variences.astype(
+            np.float32
+        )
+
+        encoder_meta_data = {
+            "model_type": "fire-red-asr-aed",
+            "version": "1",
+            "model_author": "FireRedTeam",
+            "maintainer": "k2-fsa",
+            "feat_dim": 80,
+            "cmvn_mean": ",".join(list(map(str, cmvn_mean.tolist()))),
+            "cmvn_inv_stddev": ",".join(list(map(str, cmvn_inv_stddev.tolist()))),
+            "num_decoder_layers": num_decoder_layers,
+            "num_head": num_head,
+            "head_dim": head_dim,
+            "max_len": max_len,
+            "sos": model.model.decoder.sos_id,
+            "eos": model.model.decoder.eos_id,
+            "url": "https://github.com/FireRedTeam/FireRedASR",
+            "url-2": "https://huggingface.co/FireRedTeam/FireRedASR-AED-L",
+            "comment": "This is FireRedASR-AED-L",
+        }
+
+        print(f"encoder_meta_data: {encoder_meta_data}")
+        add_meta_data(filename=encoder_filename_fp16, meta_data=encoder_meta_data)
 
     encoder_filename_int8 = "onnx/encoder.int8.onnx"
     if not Path(encoder_filename_int8).is_file():

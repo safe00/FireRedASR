@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # Copyright      2025  Xiaomi Corp.        (authors: Fangjun Kuang)
-from typing import Tuple
-
 import kaldi_native_fbank as knf
 import numpy as np
 import onnxruntime as ort
+from typing import Tuple
 import soundfile as sf
 
 """
@@ -220,14 +219,9 @@ def load_tokens(filename):
     return tokens
 
 
-def main():
-    wave_filename = "./0-zh-en.wav"
+def test_wave(wave_filename, m, id2token):
     features = compute_features(wave_filename)
 
-    m = OnnxModel(
-        encoder="./onnx/encoder.int8.onnx",
-        decoder="./onnx/decoder.int8.onnx",
-    )
     features = (features - m.cmvn_mean) * m.cmvn_inv_stddev
     features = np.expand_dims(features, axis=0)
 
@@ -253,12 +247,30 @@ def main():
         tokens[0][0] = max_token_id
         offset += 1
 
-    id2token = load_tokens("./tokens.txt")
     text = "".join([id2token[i] for i in results])
-    print(text)
 
-    text = text.replace("▁", " ")
-    print(text.strip())
+    return text.strip()
+
+
+def main():
+    wave_filename = [
+        "./sherpa-onnx-fire-red-asr-large-zh_en-2025-02-16/test_wavs/0.wav",
+        "./sherpa-onnx-fire-red-asr-large-zh_en-2025-02-16/test_wavs/1.wav",
+        "./sherpa-onnx-fire-red-asr-large-zh_en-2025-02-16/test_wavs/2.wav",
+        "./sherpa-onnx-fire-red-asr-large-zh_en-2025-02-16/test_wavs/8k.wav",
+        "./sherpa-onnx-fire-red-asr-large-zh_en-2025-02-16/test_wavs/3-sichuan.wav",
+        "./sherpa-onnx-fire-red-asr-large-zh_en-2025-02-16/test_wavs/4-tianjin.wav",
+        "./sherpa-onnx-fire-red-asr-large-zh_en-2025-02-16/test_wavs/5-henan.wav",
+    ]
+
+    m = OnnxModel(
+        encoder="./onnx/encoder.int8.onnx",
+        decoder="./onnx/decoder.int8.onnx",
+    )
+    id2token = load_tokens("./tokens.txt")
+    for w in wave_filename:
+        text = test_wave(w, m, id2token)
+        print(f"{w}\n{text}\n----\n")
 
 
 if __name__ == "__main__":
